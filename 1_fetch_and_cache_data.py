@@ -89,6 +89,28 @@ MAX_MONTHLY_PRICE_RATIO = 10.0     # a real stock very rarely multiplies
                                     # this within a single calendar month;
                                     # a bigger move is almost always bad
                                     # data, not a real market move.
+RESTRICT_TO_MEMBERSHIP_WINDOW = True  # yfinance knows tickers by their
+                                    # CURRENT owner, so an old S&P ticker
+                                    # that was later reused by a different
+                                    # company (SE->Sea Ltd, S->SentinelOne,
+                                    # SUN->Sunoco LP, POM, STI, MI...) comes
+                                    # back with that other company's prices.
+                                    # True = keep each ticker's prices only
+                                    # from 1 year before its first S&P year to
+                                    # 1 year after its last one, so reused-
+                                    # ticker data outside that window is
+                                    # blanked, and the anomaly check below
+                                    # only looks inside the window (a real,
+                                    # out-of-window move like GME's Jan-2021
+                                    # squeeze no longer gets GME's 2008-2015
+                                    # S&P history thrown away).
+KNOWN_REUSED_TICKERS = {            # reused tickers whose NEW owner's price
+                                    # history overlaps the OLD company's S&P
+                                    # years - the window above can't separate
+                                    # them, so their data is dropped outright.
+    'BBBY': 'Bed Bath & Beyond (bankrupt 2023) - ticker taken by Beyond Inc '
+            '(ex-Overstock) Aug 2025, so yfinance returns Overstock prices back to 2002',
+}
 CACHE_FILE_NAME = 'momentum_data_cache.pkl'  # MUST match the CACHE_FILE_NAME
                                     # the other three scripts look for -
                                     # don't rename this independently.
@@ -1220,6 +1242,29 @@ def detect_price_anomalies(data, max_monthly_ratio=MAX_MONTHLY_PRICE_RATIO):
 
 
 # ----------------------------------------------------------------------
+# Reused-ticker protection - see RESTRICT_TO_MEMBERSHIP_WINDOW above.
+# ----------------------------------------------------------------------
+def restrict_to_membership_windows(data, universe_by_year, exempt=()):
+    """Blanks every ticker's prices outside [Jan 1 of (first S&P year - 1),
+    Dec 31 of (last S&P year + 1)], then drops columns left with no data.
+    Returns (restricted_data, tickers_emptied)."""
+    first_year, last_year = {}, {}
+    for year, universe in universe_by_year.items():
+        for t in universe:
+            first_year[t] = min(first_year.get(t, year), year)
+            last_year[t] = max(last_year.get(t, year), year)
+    data = data.copy()
+    for t in data.columns:
+        if t in exempt or t not in first_year:
+            continue
+        outside = ((data.index < pd.Timestamp(f'{first_year[t] - 1}-01-01')) |
+                   (data.index > pd.Timestamp(f'{last_year[t] + 1}-12-31')))
+        data.loc[outside, t] = np.nan
+    emptied = sorted(c for c in data.columns if data[c].isna().all())
+    return data.drop(columns=emptied), emptied
+
+
+# ----------------------------------------------------------------------
 # Optional: drop the still-open current month for run-to-run reproducibility.
 # ----------------------------------------------------------------------
 def drop_incomplete_current_month(data, as_of=None):
@@ -1333,6 +1378,23 @@ def main():
         raise SystemExit("No price data returned - check network access / tickers. "
                           "(This script needs real yfinance access - it will NOT work "
                           "in a network-sandboxed environment.)")
+
+    reused = [t for t in KNOWN_REUSED_TICKERS if t in data.columns]
+    if reused:
+        print(f"\nDropping {len(reused)} known reused ticker(s) - yfinance returns a "
+              f"different company's prices for them:")
+        for t in reused:
+            print(f"  {t}: {KNOWN_REUSED_TICKERS[t]}")
+        data = data.drop(columns=reused)
+
+    if RESTRICT_TO_MEMBERSHIP_WINDOW:
+        data, emptied = restrict_to_membership_windows(
+            data, active_sp500_by_year, exempt={BENCHMARK_TICKER})
+        if emptied:
+            print(f"\n{len(emptied)} ticker(s) had data ONLY outside their S&P membership "
+                  f"window (+/- 1 year) - that data belongs to whoever reused the ticker "
+                  f"later, so they're treated as missing (RESTRICT_TO_MEMBERSHIP_WINDOW=True): "
+                  f"{', '.join(emptied)}")
 
     anomalies_df = detect_price_anomalies(data)
     if not anomalies_df.empty:
